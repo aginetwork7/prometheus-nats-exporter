@@ -62,6 +62,8 @@ type jszCollector struct {
 	consumerLastAck              *prometheus.Desc
 	consumerNumAckPending        *prometheus.Desc
 	consumerNumRedelivered       *prometheus.Desc
+	consumerMaxDeliveryCount     *prometheus.Desc
+	consumerMaxDeliveryStreamSeq *prometheus.Desc
 	consumerNumWaiting           *prometheus.Desc
 	consumerNumPending           *prometheus.Desc
 	consumerAckFloorStreamSeq    *prometheus.Desc
@@ -308,6 +310,20 @@ func newJszCollector(
 			consumerLabels,
 			nil,
 		),
+		// jetstream_consumer_max_delivery_count
+		consumerMaxDeliveryCount: prometheus.NewDesc(
+			prometheus.BuildFQName(system, "consumer", "max_delivery_count"),
+			"Highest delivery count among the messages currently being redelivered by a consumer",
+			consumerLabels,
+			nil,
+		),
+		// jetstream_consumer_max_delivery_stream_seq
+		consumerMaxDeliveryStreamSeq: prometheus.NewDesc(
+			prometheus.BuildFQName(system, "consumer", "max_delivery_stream_seq"),
+			"Stream sequence of the message with the highest delivery count in a consumer",
+			consumerLabels,
+			nil,
+		),
 		// jetstream_consumer_num_waiting
 		consumerNumWaiting: prometheus.NewDesc(
 			prometheus.BuildFQName(system, "consumer", "num_waiting"),
@@ -406,6 +422,8 @@ func (nc *jszCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- nc.consumerLastAck
 	ch <- nc.consumerNumAckPending
 	ch <- nc.consumerNumRedelivered
+	ch <- nc.consumerMaxDeliveryCount
+	ch <- nc.consumerMaxDeliveryStreamSeq
 	ch <- nc.consumerNumWaiting
 	ch <- nc.consumerNumPending
 
@@ -634,6 +652,8 @@ func (nc *jszCollector) Collect(ch chan<- prometheus.Metric) {
 					ch <- consumerMetric(nc.consumerDeliveredStreamSeq, float64(consumer.Delivered.Stream))
 					ch <- consumerMetric(nc.consumerNumAckPending, float64(consumer.NumAckPending))
 					ch <- consumerMetric(nc.consumerNumRedelivered, float64(consumer.NumRedelivered))
+					ch <- consumerMetric(nc.consumerMaxDeliveryCount, float64(consumer.MaxDeliveryCount))
+					ch <- consumerMetric(nc.consumerMaxDeliveryStreamSeq, float64(consumer.MaxDeliveryStreamSeq))
 					ch <- consumerMetric(nc.consumerNumWaiting, float64(consumer.NumWaiting))
 					ch <- consumerMetric(nc.consumerNumPending, float64(consumer.NumPending))
 					ch <- consumerMetric(nc.consumerAckFloorStreamSeq, float64(consumer.AckFloor.Stream))
