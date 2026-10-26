@@ -29,3 +29,5 @@ require (
 	golang.org/x/time v0.16.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
+
+replace github.com/nats-io/nats-server/v2 => github.com/aginetwork7/nats-server/v2 v2.15.2-0.20261026070151-3075b957d5e0
