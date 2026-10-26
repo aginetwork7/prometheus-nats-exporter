@@ -15,6 +15,7 @@
 package collector
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"sync"
@@ -23,6 +24,60 @@ import (
 	nats "github.com/nats-io/nats-server/v2/server"
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+// consumerKey identifies a consumer in a /jsz response.
+type consumerKey struct {
+	accountID, stream, consumer string
+}
+
+// maxDeliveryInfo holds the consumer info fields that only some nats-server
+// builds report. A nil pointer means the server did not send the field.
+type maxDeliveryInfo struct {
+	Count     *uint64 `json:"max_delivery_count"`
+	StreamSeq *uint64 `json:"max_delivery_stream_seq"`
+}
+
+// jszResponse is a /jsz response. Besides what nats.JSInfo decodes it keeps the
+// max delivery fields of every consumer, which are read here instead of from
+// nats.ConsumerInfo so that this package builds against upstream nats-server.
+type jszResponse struct {
+	nats.JSInfo
+	maxDelivery map[consumerKey]maxDeliveryInfo
+}
+
+// UnmarshalJSON decodes the response twice: into nats.JSInfo, and into a small
+// local type that only has the fields missing from upstream nats-server.
+func (r *jszResponse) UnmarshalJSON(data []byte) error {
+	if err := json.Unmarshal(data, &r.JSInfo); err != nil {
+		return err
+	}
+	var extra struct {
+		Accounts []struct {
+			ID      string `json:"id"`
+			Streams []struct {
+				Name      string `json:"name"`
+				Consumers []struct {
+					Name string `json:"name"`
+					maxDeliveryInfo
+				} `json:"consumer_detail"`
+			} `json:"stream_detail"`
+		} `json:"account_details"`
+	}
+	if err := json.Unmarshal(data, &extra); err != nil {
+		return err
+	}
+	r.maxDelivery = make(map[consumerKey]maxDeliveryInfo)
+	for _, account := range extra.Accounts {
+		for _, stream := range account.Streams {
+			for _, consumer := range stream.Consumers {
+				if consumer.Count != nil || consumer.StreamSeq != nil {
+					r.maxDelivery[consumerKey{account.ID, stream.Name, consumer.Name}] = consumer.maxDeliveryInfo
+				}
+			}
+		}
+	}
+	return nil
+}
 
 type jszCollector struct {
 	sync.Mutex
@@ -56,18 +111,18 @@ type jszCollector struct {
 	streamLimitMessages *prometheus.Desc
 
 	// Consumer stats
-	consumerDeliveredConsumerSeq *prometheus.Desc
-	consumerDeliveredStreamSeq   *prometheus.Desc
-	consumerLastDelivery         *prometheus.Desc
-	consumerLastAck              *prometheus.Desc
-	consumerNumAckPending        *prometheus.Desc
-	consumerNumRedelivered       *prometheus.Desc
-	consumerMaxDeliveryCount     *prometheus.Desc
-	consumerMaxDeliveryStreamSeq *prometheus.Desc
-	consumerNumWaiting           *prometheus.Desc
-	consumerNumPending           *prometheus.Desc
-	consumerAckFloorStreamSeq    *prometheus.Desc
-	consumerAckFloorConsumerSeq  *prometheus.Desc
+	consumerDeliveredConsumerSeq     *prometheus.Desc
+	consumerDeliveredStreamSeq       *prometheus.Desc
+	consumerLastDelivery             *prometheus.Desc
+	consumerLastAck                  *prometheus.Desc
+	consumerNumAckPending            *prometheus.Desc
+	consumerNumRedelivered           *prometheus.Desc
+	consumerHighestDeliveryCount     *prometheus.Desc
+	consumerHighestDeliveryStreamSeq *prometheus.Desc
+	consumerNumWaiting               *prometheus.Desc
+	consumerNumPending               *prometheus.Desc
+	consumerAckFloorStreamSeq        *prometheus.Desc
+	consumerAckFloorConsumerSeq      *prometheus.Desc
 
 	// Stream source stats
 	streamSourceLag    *prometheus.Desc
@@ -310,17 +365,20 @@ func newJszCollector(
 			consumerLabels,
 			nil,
 		),
-		// jetstream_consumer_max_delivery_count
-		consumerMaxDeliveryCount: prometheus.NewDesc(
-			prometheus.BuildFQName(system, "consumer", "max_delivery_count"),
-			"Highest delivery count among the messages currently being redelivered by a consumer",
+		// jetstream_consumer_highest_delivery_count
+		consumerHighestDeliveryCount: prometheus.NewDesc(
+			prometheus.BuildFQName(system, "consumer", "highest_delivery_count"),
+			"Highest delivery count among the messages a consumer is currently redelivering, 0 if none. "+
+				"Only reported by a nats-server that provides max_delivery_count in the consumer info, absent otherwise",
 			consumerLabels,
 			nil,
 		),
-		// jetstream_consumer_max_delivery_stream_seq
-		consumerMaxDeliveryStreamSeq: prometheus.NewDesc(
-			prometheus.BuildFQName(system, "consumer", "max_delivery_stream_seq"),
-			"Stream sequence of the message with the highest delivery count in a consumer",
+		// jetstream_consumer_highest_delivery_stream_seq
+		consumerHighestDeliveryStreamSeq: prometheus.NewDesc(
+			prometheus.BuildFQName(system, "consumer", "highest_delivery_stream_seq"),
+			"Stream sequence of the message with the highest delivery count in a consumer, only meaningful when "+
+				"the highest delivery count is above 0. Only reported by a nats-server that provides "+
+				"max_delivery_stream_seq in the consumer info, absent otherwise",
 			consumerLabels,
 			nil,
 		),
@@ -422,8 +480,8 @@ func (nc *jszCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- nc.consumerLastAck
 	ch <- nc.consumerNumAckPending
 	ch <- nc.consumerNumRedelivered
-	ch <- nc.consumerMaxDeliveryCount
-	ch <- nc.consumerMaxDeliveryStreamSeq
+	ch <- nc.consumerHighestDeliveryCount
+	ch <- nc.consumerHighestDeliveryStreamSeq
 	ch <- nc.consumerNumWaiting
 	ch <- nc.consumerNumPending
 
@@ -439,7 +497,7 @@ func (nc *jszCollector) Describe(ch chan<- *prometheus.Desc) {
 // Collect gathers the server jsz metrics.
 func (nc *jszCollector) Collect(ch chan<- prometheus.Metric) {
 	for _, server := range nc.servers {
-		var resp nats.JSInfo
+		var resp jszResponse
 		var suffix string
 
 		switch strings.ToLower(nc.endpoint) {
@@ -652,8 +710,14 @@ func (nc *jszCollector) Collect(ch chan<- prometheus.Metric) {
 					ch <- consumerMetric(nc.consumerDeliveredStreamSeq, float64(consumer.Delivered.Stream))
 					ch <- consumerMetric(nc.consumerNumAckPending, float64(consumer.NumAckPending))
 					ch <- consumerMetric(nc.consumerNumRedelivered, float64(consumer.NumRedelivered))
-					ch <- consumerMetric(nc.consumerMaxDeliveryCount, float64(consumer.MaxDeliveryCount))
-					ch <- consumerMetric(nc.consumerMaxDeliveryStreamSeq, float64(consumer.MaxDeliveryStreamSeq))
+					if md, ok := resp.maxDelivery[consumerKey{accountID, streamName, consumerName}]; ok {
+						if md.Count != nil {
+							ch <- consumerMetric(nc.consumerHighestDeliveryCount, float64(*md.Count))
+						}
+						if md.StreamSeq != nil {
+							ch <- consumerMetric(nc.consumerHighestDeliveryStreamSeq, float64(*md.StreamSeq))
+						}
+					}
 					ch <- consumerMetric(nc.consumerNumWaiting, float64(consumer.NumWaiting))
 					ch <- consumerMetric(nc.consumerNumPending, float64(consumer.NumPending))
 					ch <- consumerMetric(nc.consumerAckFloorStreamSeq, float64(consumer.AckFloor.Stream))
